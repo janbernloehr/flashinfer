@@ -21,6 +21,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <tuple>
 #include <type_traits>
@@ -1026,6 +1027,49 @@ inline void check_gemm1_bias_mn(Optional<TensorView> const& gemm1_bias,
       << "gemm1_bias must have shape [num_tokens, top_k, 2 * intermediate_size].";
 }
 
+// Persistent, CUDA-graph-capture-safe routing scratch (flashinfer#3427, #3168).
+//
+// The trtllm-gen MoE routing scratch (expanded_idx_to_permuted_idx and its
+// siblings) used to be allocated per call via alloc_tensor(), i.e. from the
+// framework caching allocator. Under CUDA-graph *piecewise* capture (e.g. SGLang
+// PCG, one graph piece per decoder layer) those allocations come from the graph's
+// private memory pool, whose offsets are recycled across the separately captured
+// layer pieces. The routing cooperative kernel bakes the address of its in-bounds
+// store `mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx`; at replay that
+// address aliases a *different* piece's allocation -> corruption -> a downstream
+// trtllm-gen GEMM raises an illegal memory access.
+//
+// The scratch is pure per-call working memory (written by routing, consumed by
+// the GEMMs within the same call), so a single persistent buffer per device,
+// allocated once and reused across all layers and graph replays, is correct and
+// keeps the baked address stable. It is pre-sized to a generous maximum so the
+// arena is allocated before capture and never re-allocated during capture (a
+// re-allocation mid-capture would re-introduce the pool-relative address). The
+// arena is a few MB per device.
+namespace {
+constexpr int64_t kMaxRoutingScratchTokens = 65536;  // upper bound on tokens processed per capture
+struct RoutingScratchSlot {
+  Tensor tensor;
+  int64_t capacity = 0;
+};
+struct RoutingScratchArena {
+  RoutingScratchSlot num_tokens_per_expert, total_num_padded_tokens, expanded_idx_to_permuted_idx,
+      permuted_idx_to_token_idx, permuted_idx_to_expanded_idx, expert_indexes,
+      expert_count_histogram, cta_idx_xy_to_batch_idx, cta_idx_xy_to_mn_limit, num_non_exiting_ctas;
+};
+std::mutex g_routing_scratch_mu;
+std::unordered_map<int, RoutingScratchArena> g_routing_scratch;  // key = device_id
+// Grow-only int32 slot; once seeded at kMaxRoutingScratchTokens it is not
+// re-allocated for any smaller/equal request, so its address is capture-stable.
+inline Tensor& ensure_routing_slot(RoutingScratchSlot& slot, int64_t numel, DLDevice dev) {
+  if (slot.capacity < numel) {
+    slot.tensor = alloc_tensor({numel}, dl_int32, dev);
+    slot.capacity = numel;
+  }
+  return slot.tensor;
+}
+}  // namespace
+
 class FusedMoeLauncher {
  protected:
   Optional<TensorView> routing_logits;
@@ -1263,6 +1307,11 @@ class FusedMoeLauncher {
   Tensor cta_idx_xy_to_mn_limit;
   Tensor num_non_exiting_ctas;
 
+  // Set by run() before prepare_routing(): true when expanded_idx_to_permuted_idx
+  // is returned to the caller (must stay per-call then; otherwise it may share the
+  // persistent arena). See run()'s return-array layout.
+  bool mExpandedIdxReturned = false;
+
   void* permuted_idx_to_expanded_idx_ptr() const {
     return permuted_idx_to_expanded_idx.defined() ? permuted_idx_to_expanded_idx.data_ptr()
                                                   : nullptr;
@@ -1272,46 +1321,49 @@ class FusedMoeLauncher {
     int32_t const totalExpertsPerToken = args->top_k + args->num_fused_shared_experts;
     int32_t const totalNumExperts = args->num_experts + args->num_fused_shared_experts;
 
-    // Allocate routing phase workspace tensors
-    num_tokens_per_expert = alloc_tensor({totalNumExperts}, dl_int32, hidden_states.device());
+    // Allocate routing phase workspace from the persistent per-device arena
+    // (see RoutingScratchArena; flashinfer#3427, #3168).
+    auto dev = hidden_states.device();
     int32_t max_num_padded_tokens =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
             args->num_tokens, totalExpertsPerToken, totalNumExperts, tile_tokens_dim);
-
-    total_num_padded_tokens = alloc_tensor({1}, dl_int32, hidden_states.device());
-
-    expanded_idx_to_permuted_idx =
-        alloc_tensor({args->num_tokens * totalExpertsPerToken}, dl_int32, hidden_states.device());
-
-    // WAR: the routed batched-GEMM kernels read one int32 past the end of the route map.
-    // TODO: drop the +1 once the fixed kernel cubins land.
-    permuted_idx_to_token_idx =
-        alloc_tensor({max_num_padded_tokens + 1}, dl_int32, hidden_states.device());
-
-    if (gemm1_bias_type == batchedGemm::gemm::BiasType::Mn) {
-      permuted_idx_to_expanded_idx =
-          alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
-    }
-
-    expert_indexes =
-        alloc_tensor({args->num_tokens, totalExpertsPerToken}, dl_int32, hidden_states.device());
-
-    // expert_weights allocation should be done by derived class since data type could vary
-
     int64_t const size_of_expert_count_histogram = std::max(totalNumExperts * 2, 256 * 2);
-    expert_count_histogram = alloc_tensor({size_of_expert_count_histogram},
-                                          dl_int32,  // 256 is the max number of threads per block
-                                                     // and max number of experts
-                                          hidden_states.device());
-
-    int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
-        args->num_tokens, totalExpertsPerToken, totalNumExperts, tile_tokens_dim);
-
-    cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
-
-    cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
-
-    num_non_exiting_ctas = alloc_tensor({1}, dl_int32, hidden_states.device());
+    int64_t const scratch_tokens = std::max<int64_t>(args->num_tokens, kMaxRoutingScratchTokens);
+    int32_t const scratch_padded =
+        tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
+            scratch_tokens, totalExpertsPerToken, totalNumExperts, tile_tokens_dim);
+    int32_t const scratch_ctas =
+        tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
+            scratch_tokens, totalExpertsPerToken, totalNumExperts, tile_tokens_dim);
+    {
+      std::lock_guard<std::mutex> lk(g_routing_scratch_mu);
+      auto& sc = g_routing_scratch[dev.device_id];
+      num_tokens_per_expert = ensure_routing_slot(sc.num_tokens_per_expert, totalNumExperts, dev);
+      total_num_padded_tokens = ensure_routing_slot(sc.total_num_padded_tokens, 1, dev);
+      // WAR (flashinfer#4237): routed batched-GEMM kernels read one int32 past the route map end.
+      permuted_idx_to_token_idx =
+          ensure_routing_slot(sc.permuted_idx_to_token_idx, scratch_padded + 1, dev);
+      if (gemm1_bias_type == batchedGemm::gemm::BiasType::Mn) {
+        permuted_idx_to_expanded_idx =
+            ensure_routing_slot(sc.permuted_idx_to_expanded_idx, scratch_padded, dev);
+      }
+      expert_indexes =
+          ensure_routing_slot(sc.expert_indexes, scratch_tokens * totalExpertsPerToken, dev);
+      expert_count_histogram =
+          ensure_routing_slot(sc.expert_count_histogram, size_of_expert_count_histogram, dev);
+      cta_idx_xy_to_batch_idx = ensure_routing_slot(sc.cta_idx_xy_to_batch_idx, scratch_ctas, dev);
+      cta_idx_xy_to_mn_limit = ensure_routing_slot(sc.cta_idx_xy_to_mn_limit, scratch_ctas, dev);
+      num_non_exiting_ctas = ensure_routing_slot(sc.num_non_exiting_ctas, 1, dev);
+      // expanded_idx_to_permuted_idx is returned to the caller when mExpandedIdxReturned;
+      // only share it (persistent) when it is not returned.
+      if (mExpandedIdxReturned) {
+        expanded_idx_to_permuted_idx =
+            alloc_tensor({args->num_tokens * totalExpertsPerToken}, dl_int32, dev);
+      } else {
+        expanded_idx_to_permuted_idx = ensure_routing_slot(
+            sc.expanded_idx_to_permuted_idx, scratch_tokens * totalExpertsPerToken, dev);
+      }
+    }
 
     workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
     workspace.total_max_padded_tokens = max_num_padded_tokens;
@@ -1468,6 +1520,7 @@ class FusedMoeLauncher {
                                   bool return_activation_output = false) {
     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
+    mExpandedIdxReturned = !args->do_finalize || return_activation_output;
     prepare_routing();
 
     // Execute routing
@@ -2053,6 +2106,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
                           bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
                           bool return_activation_output = false) override {
     check_routing();
+    mExpandedIdxReturned = !args->do_finalize || return_activation_output;
     prepare_routing();
 
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
@@ -2587,6 +2641,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                           bool return_activation_output = false) override {
     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
+    mExpandedIdxReturned = !args->do_finalize || return_activation_output;
     prepare_routing();
 
     cudaStream_t routing_stream = get_stream(hidden_states.device());
@@ -3254,6 +3309,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                           bool return_activation_output = false) override {
     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
+    mExpandedIdxReturned = !args->do_finalize || return_activation_output;
     prepare_routing();
 
     // Execute routing
